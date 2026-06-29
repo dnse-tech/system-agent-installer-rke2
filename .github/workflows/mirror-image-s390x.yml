@@ -1,21 +1,19 @@
-# Mirror a multi-arch upstream image (incl. s390x) into ghcr.io/<owner> verbatim.
-#
-# Some rke2 core images (e.g. mirrored-pause) already carry an s390x leg upstream on docker.io but are
-# absent under our org. When the s390x rke2 binary bakes REGISTRY=ghcr.io/<owner>, those refs must
-# resolve there. A local `imagetools create` push fails (PAT lacks write:packages); GITHUB_TOKEN here
-# has packages:write, so the copy runs in CI. `imagetools create` copies the digest-pinned manifest
-# (all legs) without re-tagging contents — published per-arch digests match upstream.
+# Combine/copy one or more source manifests into ghcr.io/<owner>/<dst>.
+# Single src = verbatim mirror (e.g. mirrored-pause). Multiple srcs = merge legs (e.g. our s390x leg +
+# upstream amd64/arm64) — used to publish images under the name/tag the rke2 binary's baked
+# ghcr.io/<owner> registry expects when our build used a different name/tag. GITHUB_TOKEN has
+# packages:write (a local PAT does not).
 name: Mirror image to GHCR (s390x-bearing)
 
 on:
   workflow_dispatch:
     inputs:
-      src:
-        description: "Fully-qualified source ref (e.g. docker.io/rancher/mirrored-pause:3.6)"
+      srcs:
+        description: "Space-separated source refs to merge (s390x leg first, then upstream multi-arch)"
         required: true
         type: string
       dst:
-        description: "Destination under ghcr.io/<owner> (e.g. mirrored-pause:3.6)"
+        description: "Destination under ghcr.io/<owner> (e.g. kube-webhook-certgen:v1.14.5-hardened2)"
         required: true
         type: string
 
@@ -35,14 +33,14 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Copy manifest (all legs) to GHCR
+      - name: Combine/copy manifest to GHCR
         env:
-          SRC: ${{ inputs.src }}
+          SRCS: ${{ inputs.srcs }}
           DST: ${{ inputs.dst }}
         run: |
           set -euo pipefail
           OWNER='${{ github.repository_owner }}'
-          docker buildx imagetools create -t "ghcr.io/${OWNER}/${DST}" "$SRC"
-          echo "Mirrored $SRC -> ghcr.io/${OWNER}/${DST}"
+          docker buildx imagetools create -t "ghcr.io/${OWNER}/${DST}" $SRCS
+          echo "Published ghcr.io/${OWNER}/${DST}"
           docker buildx imagetools inspect --raw "ghcr.io/${OWNER}/${DST}" \
             | jq -r '.manifests[]?.platform | "\(.os)/\(.architecture)"' | grep -v unknown | sort -u
