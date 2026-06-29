@@ -1,0 +1,129 @@
+# Hardened s390x release workflow for system-agent-installer-rke2 (the image Rancher's system-agent
+# runs to install RKE2 on a node). package/Dockerfile is FROM scratch + run.sh + the rke2 install
+# tarballs that scripts/download fetches. Upstream rke2 ships no s390x tarball, so we redirect
+# scripts/download rancher/rke2 -> dnse-tech/rke2 (which publishes s390x assets via its
+# release-assets-s390x.yml), build the FROM-scratch image for linux/s390x, then combine with the
+# upstream rancher/system-agent-installer-rke2 linux amd64/arm64 legs (digest-pinned, detected
+# dynamically) into ghcr.io/<owner>/system-agent-installer-rke2:<dockerized>.
+#
+# Runs on X64 (FROM scratch + COPY only — no execution, so buildx --platform linux/s390x needs no
+# QEMU; X64 pool has the tooling). ghcr tag is the +->- dockerized form (matches upstream).
+# Hardening: workflow_dispatch-only; immutable tag (force=true to overwrite); upstream legs digest-pinned.
+name: Release s390x
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "rke2 release tag (e.g. v1.35.5+rke2r2)"
+        required: true
+        type: string
+      force:
+        description: "Overwrite the combined tag if it already exists"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  DOCKER_CONTEXT: default
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/system-agent-installer-rke2
+  UPSTREAM_IMAGE: rancher/system-agent-installer-rke2
+
+jobs:
+  build-s390x:
+    runs-on: [self-hosted, X64, 'os:ubuntu-24.04']
+    outputs:
+      dockerized: ${{ steps.ver.outputs.dockerized }}
+    steps:
+      - name: Checkout exact tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Resolve dockerized tag
+        id: ver
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          echo "dockerized=${TAG//+/-}" >> "$GITHUB_OUTPUT"   # v1.35.5+rke2r2 -> v1.35.5-rke2r2
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Stage s390x install assets (redirect download to dnse-tech/rke2 fork)
+        env:
+          TAG: ${{ inputs.tag }}
+          ARCH: s390x
+        run: |
+          set -euxo pipefail
+          sed -i 's#github.com/rancher/rke2/releases/download#github.com/dnse-tech/rke2/releases/download#' scripts/download
+          ARCH=s390x bash scripts/download
+          ls -la artifacts/
+      - name: Build & push s390x image (FROM scratch + s390x artifacts)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: package/Dockerfile
+          platforms: linux/s390x
+          push: true
+          provenance: false
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.dockerized }}-s390x
+
+  combine:
+    needs: build-s390x
+    runs-on: [self-hosted, X64, 'os:ubuntu-24.04']
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Refuse to clobber existing combined tag unless force
+        env:
+          TAG: ${{ needs.build-s390x.outputs.dockerized }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          IMG="${REGISTRY}/${IMAGE_NAME}:$TAG"
+          if docker buildx imagetools inspect "$IMG" >/dev/null 2>&1; then
+            if [ "$FORCE" != "true" ]; then
+              echo "::error::$IMG exists and force=false (immutable). Re-run with force=true."; exit 1
+            fi
+            echo "::warning::$IMG exists; force=true → overwriting."
+          fi
+      - name: Combine s390x + upstream linux legs (digest-pinned, dynamic)
+        env:
+          TAG: ${{ needs.build-s390x.outputs.dockerized }}
+          UP: ${{ env.UPSTREAM_IMAGE }}
+        run: |
+          set -euo pipefail
+          IMG="${REGISTRY}/${IMAGE_NAME}"
+          RAW="$(docker buildx imagetools inspect --raw "$UP:$TAG")"
+          mapfile -t LEGS < <(echo "$RAW" | jq -r --arg up "$UP" '.manifests[]
+            | select(.platform.os=="linux" and .platform.architecture!="unknown")
+            | "\($up)@\(.digest)"')
+          if [ "${#LEGS[@]}" -eq 0 ]; then echo "::error::no upstream linux legs for $UP:$TAG"; exit 1; fi
+          echo "upstream linux legs:"; printf '  %s\n' "${LEGS[@]}"
+          docker buildx imagetools create -t "$IMG:$TAG" "$IMG:$TAG-s390x" "${LEGS[@]}"
+          echo "Created $IMG:$TAG"
+      - name: Verify s390x in combined manifest
+        env:
+          TAG: ${{ needs.build-s390x.outputs.dockerized }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect --raw "${REGISTRY}/${IMAGE_NAME}:$TAG" \
+            | jq -e '[.manifests[].platform.architecture] | index("s390x") != null' >/dev/null \
+            || { echo "::error::s390x leg missing"; exit 1; }
+          docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAME}:$TAG"
